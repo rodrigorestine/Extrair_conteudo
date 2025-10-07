@@ -3,6 +3,7 @@ import subprocess
 import os
 import threading
 import re
+import time
 from typing import List, Dict, Tuple
 from urllib.parse import urljoin 
 
@@ -142,6 +143,52 @@ class App(ctk.CTk):
             print(f"    AVISO: Falha ao raspar aulas em {discipline_url}. Erro: {e}")
             return [f"ERRO: Não foi possível extrair as aulas. {e.__class__.__name__}"]
 
+    def wait_for_post_login(self, page, timeout: int = 300000) -> bool:
+        """Aguarda indicadores que confirmem login bem-sucedido.
+
+        Retorna True se detectar sucesso (URL do dashboard ou seletores típicos),
+        caso contrário False após timeout (ms).
+        """
+        # Seletores que comumente aparecem em páginas de usuário/logadas
+        indicators = [
+            "h1",
+            ".course-title",
+            ".course-header",
+            ".dashboard-title",
+            "nav[data-testid='main-nav']",
+            ".user-menu",
+            ".dashboard-content",
+        ]
+
+        check_interval = 1.0
+        elapsed = 0.0
+        timeout_s = timeout / 1000.0
+
+        while elapsed < timeout_s:
+            try:
+                current_url = page.url
+                # Verifica padrões de URL do dashboard/app
+                if any(pat in current_url for pat in ["/app/dashboard", "/dashboard", "/app/"]):
+                    return True
+
+                # Verifica se algum seletor indicador está presente e visível
+                for sel in indicators:
+                    try:
+                        el = page.query_selector(sel)
+                        if el and getattr(el, 'is_visible', lambda: True)():
+                            return True
+                    except Exception:
+                        # ignorar erros transitórios ao consultar seletores
+                        pass
+            except Exception:
+                # ignorar erros de leitura de URL
+                pass
+
+            time.sleep(check_interval)
+            elapsed += check_interval
+
+        return False
+
     def run_playwright_scraper(self, url: str):
         """Função principal que coordena a extração multi-nível, com gerenciamento de sessão."""
         browser = None
@@ -176,28 +223,45 @@ class App(ctk.CTk):
 
                 if not load_state:
                     # --- FLUXO DE PRIMEIRO LOGIN MANUAL ---
-                    self.update_status("⚠️ Faça login no navegador aberto. Pressione ENTER no console para continuar. Você tem 30 segundos após apertar ENTER.", "yellow")
+                    # Instruções para o usuário: não é necessário pressionar ENTER.
+                    self.update_status("⚠️ Faça login no navegador aberto. O script detectará automaticamente quando o login for concluído (pode levar alguns minutos).", "yellow")
                     print("\n" + "="*50)
-                    input(">>> LOGIN MANUAL NECESSÁRIO. Pressione ENTER no terminal APÓS logar no navegador. <<<")
+                    print(">>> LOGIN MANUAL NECESSÁRIO. Complete o login no navegador. O script irá detectar automaticamente quando o login for validado. <<<")
                     print("="*50 + "\n")
 
-                    # O timeout para esperar o seletor foi aumentado para 30000ms (30 segundos)
-                    VALIDATION_TIMEOUT = 30000 # 30 segundos
-                    
-                    # Verificação Pós-Login
-                    self.update_status("Verificando login e recarregando a página do pacote...", "blue")
+                    # Timeout aumentado para permitir login manual (padrão 300s / 5 minutos)
+                    VALIDATION_TIMEOUT = 300000  # 300 segundos (5 minutos)
+
+                    # Verificação Pós-Login usando heurísticas mais robustas
+                    self.update_status("Verificando login e aguardando redirecionamento/elementos da área logada (até 5 minutos)...", "blue")
                     try:
-                        # Espera por um elemento típico de página logada por 30s
-                        page.wait_for_selector("h1, .course-title, .course-header, .dashboard-title", timeout=VALIDATION_TIMEOUT) 
+                        ok = self.wait_for_post_login(page, timeout=VALIDATION_TIMEOUT)
+                        if not ok:
+                            # Salva diagnóstico para análise
+                            try:
+                                ts = int(time.time())
+                                screenshot_path = f"login_timeout_{ts}.png"
+                                html_path = f"login_timeout_{ts}.html"
+                                page.screenshot(path=screenshot_path, full_page=True)
+                                with open(html_path, 'w', encoding='utf-8') as hf:
+                                    hf.write(page.content())
+                                print(f"Diagnóstico salvo: {screenshot_path}, {html_path}")
+                            except Exception as diag_e:
+                                print(f"Falha ao salvar diagnóstico de timeout: {diag_e}")
+
+                            self.update_status("Falha no login/validação após o tempo limite. Verifique se você concluiu o login no navegador aberto.", "red")
+                            if os.path.exists(STORAGE_STATE_PATH):
+                                os.remove(STORAGE_STATE_PATH)
+                            raise Exception("Falha na validação pós-login: timeout")
+
                         # Salva o estado da sessão para uso futuro
                         context.storage_state(path=STORAGE_STATE_PATH)
                         self.update_status("Estado da sessão salvo com sucesso. Próximas extrações serão mais rápidas.", "green")
                     except Exception as check_e:
-                        self.update_status("Falha no login/validação após 30 segundos. Verifique o console.", "red")
-                        # Em caso de falha, limpa o estado que pode ter sido salvo corrompido
+                        # Em caso de erro, limpa o estado salvo (se existir)
                         if os.path.exists(STORAGE_STATE_PATH):
-                             os.remove(STORAGE_STATE_PATH)
-                        raise Exception(f"Falha na validação pós-login: {check_e}")
+                            os.remove(STORAGE_STATE_PATH)
+                        raise
                 
                 # Garante que estamos na URL correta após o login/carregamento da sessão
                 page.goto(url, wait_until="domcontentloaded")
